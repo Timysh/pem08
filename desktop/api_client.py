@@ -1,9 +1,9 @@
 """
 API клиент для связи с backend
 """
+import os
 import requests
-from typing import Optional, Dict, Any
-import base64
+from typing import Dict, Any
 
 
 class APIClient:
@@ -51,7 +51,8 @@ class APIClient:
         """Анализ изображения конкурента"""
         try:
             with open(image_path, 'rb') as f:
-                files = {'file': (image_path.split('/')[-1], f, 'image/jpeg')}
+                filename = os.path.basename(image_path)
+                files = {'file': (filename, f, 'image/jpeg')}
                 return self._request("POST", "/analyze_image", files=files)
         except FileNotFoundError:
             return {"success": False, "error": "Файл не найден"}

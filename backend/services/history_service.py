@@ -112,7 +112,14 @@ class HistoryService:
         logger.info("📋 Получение истории")
         history = self._load_history()
         logger.info(f"  Записей: {len(history)}")
-        return [HistoryItem(**item) for item in history]
+        result = []
+        for item in history:
+            try:
+                # timestamp в файле хранится как ISO-строка; Pydantic приведёт к datetime
+                result.append(HistoryItem(**item))
+            except Exception as e:
+                logger.warning(f"  Пропуск некорректной записи истории: {e}")
+        return result
     
     def clear_history(self):
         """Очистить историю"""

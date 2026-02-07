@@ -11,9 +11,35 @@
 
 ### 1. Установка зависимостей
 
-```bash
+Из **корня проекта** активируйте виртуальное окружение (если используете venv), затем установите зависимости:
+
+**Вариант A — из корня проекта (рекомендуется):**
+
+```powershell
+# Перейдите в корень проекта (папка, где run.py и папка .venv)
+cd C:\Users\user\Desktop\testGit1
+
+# Активируйте виртуальное окружение (PowerShell):
+.\.venv\Scripts\Activate.ps1
+
+# Установите зависимости для desktop:
 cd desktop
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+```
+
+**Вариант B — вы уже в папке `desktop`, а `python` не находится:**
+
+Укажите путь к Python из виртуального окружения проекта (venv лежит в родительской папке):
+
+```powershell
+# Из папки desktop:
+..\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Запуск приложения тогда:
+
+```powershell
+..\.venv\Scripts\python.exe main.py
 ```
 
 ### 2. Запуск приложения

@@ -17,29 +17,64 @@ from backend.models.schemas import CompetitorAnalysis, ImageAnalysis
 # Логгер для сервиса
 logger = logging.getLogger("competitor_monitor.openai")
 
+# Сообщение для пользователя при отказе из-за политики контента
+CONTENT_POLICY_MESSAGE = (
+    "Недопустимый контент. Изображение не может быть проанализировано из-за ограничений политики контента. "
+    "Загрузите скриншот сайта, баннер или фото упаковки конкурента."
+)
+
+
+class ContentPolicyError(Exception):
+    """Исключение при отказе API из-за недопустимого контента"""
+    def __init__(self, message: str = CONTENT_POLICY_MESSAGE):
+        self.message = message
+        super().__init__(message)
+
 
 class OpenAIService:
-    """Сервис для анализа через ProxyAPI"""
+    """Сервис для анализа через OpenAI или ProxyAPI"""
     
     def __init__(self):
         logger.info("=" * 50)
         logger.info("Инициализация OpenAI сервиса")
-        logger.info(f"  Base URL: {settings.proxy_api_base_url}")
+        # Приоритет: если задан OPENAI_API_KEY — используем прямой API OpenAI
+        if settings.openai_api_key:
+            self._use_direct_openai = True
+            api_key = settings.openai_api_key
+            base_url = None  # официальный api.openai.com
+            logger.info("  Режим: прямой OpenAI API (api.openai.com)")
+        else:
+            self._use_direct_openai = False
+            api_key = settings.proxy_api_key
+            base_url = settings.proxy_api_base_url
+            logger.info(f"  Режим: ProxyAPI")
+            logger.info(f"  Base URL: {settings.proxy_api_base_url}")
         logger.info(f"  Модель текста: {settings.openai_model}")
         logger.info(f"  Модель vision: {settings.openai_vision_model}")
-        logger.info(f"  API ключ: {'*' * 10}...{settings.proxy_api_key[-4:] if settings.proxy_api_key else 'НЕ ЗАДАН'}")
+        logger.info(f"  API ключ: {'*' * 10}...{api_key[-4:] if api_key else 'НЕ ЗАДАН'}")
         
-        # ProxyAPI - OpenAI-совместимый API для России
-        self.client = OpenAI(
-            api_key=settings.proxy_api_key,
-            base_url=settings.proxy_api_base_url
-        )
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = settings.openai_model
         self.vision_model = settings.openai_vision_model
         
         logger.info("OpenAI сервис инициализирован успешно ✓")
         logger.info("=" * 50)
     
+    def _is_content_refusal(self, content: str) -> bool:
+        """Проверить, похож ли ответ API на отказ из-за политики контента"""
+        if not content or len(content.strip()) < 20:
+            return False
+        text = content.strip().lower()
+        refusal_phrases = [
+            "cannot analyze", "can't analyze", "unable to analyze", "won't analyze",
+            "inappropriate", "content policy", "policy violation", "not able to",
+            "не могу проанализировать", "не могу описать", "отказано", "политик",
+            "не подходит для анализа", "недопустимый контент", "ограничени",
+            "refuse", "decline", "cannot assist", "can't assist", "against my",
+            "against our", "safety", "не применимо к данному изображению"
+        ]
+        return any(phrase in text for phrase in refusal_phrases)
+
     def _parse_json_response(self, content: str) -> dict:
         """Извлечь JSON из ответа модели"""
         logger.debug(f"Парсинг JSON ответа, длина: {len(content)} символов")
@@ -73,21 +108,111 @@ class OpenAIService:
         logger.info(f"  Превью: {text[:100]}...")
         logger.info(f"  Модель: {self.model}")
         
-        system_prompt = """Ты — эксперт по конкурентному анализу. Проанализируй предоставленный текст конкурента и верни структурированный JSON-ответ.
-
-Формат ответа (строго JSON):
-{
-    "strengths": ["сильная сторона 1", "сильная сторона 2", ...],
-    "weaknesses": ["слабая сторона 1", "слабая сторона 2", ...],
-    "unique_offers": ["уникальное предложение 1", "уникальное предложение 2", ...],
-    "recommendations": ["рекомендация 1", "рекомендация 2", ...],
-    "summary": "Краткое резюме анализа"
-}
-
-Важно:
-- Каждый массив должен содержать 3-5 пунктов
-- Пиши на русском языке
-- Будь конкретен и практичен в рекомендациях"""
+        system_prompt = """{
+  "system_prompt": "Ты — эксперт по конкурентному анализу, контент-стратегии и копирайтингу. Проанализируй предоставленный текст конкурента (презентацию, описание продукта, коммерческое предложение, лендинг) и верни всесторонний, структурированный JSON-ответ.",
+  
+  "response_format": {
+    "type": "json_object",
+    "structure": {
+      "quantitative_scores": {
+        "persuasiveness_score": "Оценка убедительности текста и аргументации (0-10, где 10 — максимально убедительно)",
+        "clarity_score": "Оценка ясности, структурированности и понятности изложения (0-10, где 10 — идеальная ясность)",
+        "uniqueness_score": "Оценка уникальности и дифференциации от конкурентов (0-10, где 10 — высокая уникальность)",
+        "cta_effectiveness_score": "Оценка эффективности призывов к действию (0-10, где 10 — максимально эффективно)",
+        "seo_potential": "Уровень SEO-оптимизации текста (0-10, где 10 — отлично оптимизировано, 0 — требует серьёзной доработки)"
+      },
+      "qualitative_analysis": {
+        "strengths": "Сильные стороны текста (3-5 конкретных пунктов)",
+        "weaknesses": "Слабые стороны текста (3-5 конкретных пунктов)",
+        "unique_offers": "Уникальные предложения/фичи в тексте (3-5 конкретных пунктов)",
+        "competitive_advantages": "Явные текстовые преимущества перед конкурентами (3-5 конкретных пунктов)",
+        "competitive_threats": "Текстовые уязвимости для атаки конкурентов (3-5 конкретных пунктов)"
+      },
+      "style_and_tone_analysis": {
+        "voice_and_tone": "Анализ голоса и тона текста (формальный, дружелюбный, экспертный и т.д.)",
+        "target_audience_alignment": "Соответствие текста целевой аудитории",
+        "emotional_triggers": "Используемые эмоциональные триггеры в тексте",
+        "pain_points_coverage": "Как текст покрывает боли целевой аудитории"
+      },
+      "structural_analysis": {
+        "headline_effectiveness": "Оценка заголовков и подзаголовков",
+        "information_architecture": "Логика структуры и подачи информации",
+        "argumentation_strength": "Сила аргументации и доказательной базы",
+        "benefit_presentation": "Как представлены выгоды для клиента"
+      },
+      "audience_insights": {
+        "primary_audience": "Основная целевая аудитория, на которую ориентирован текст",
+        "secondary_audience": "Вторичная аудитория, которую может зацепить текст"
+      },
+      "actionable_recommendations": {
+        "high_priority": "Рекомендации высокого приоритета (3-5 конкретных пунктов)",
+        "medium_priority": "Рекомендации среднего приоритета (3-5 конкретных пунктов)",
+        "low_priority": "Рекомендации низкого приоритета (3-5 конкретных пунктов)"
+      },
+      "summary": "Комплексное резюме анализа. Выдели ключевые выводы: основное сообщение, самая сильная сторона и самая критичная слабость текста. Кратко обоснуй ключевые количественные оценки."
+    }
+  },
+  
+  "analysis_criteria": [
+    "Убедительность (persuasiveness_score): Сила аргументации, использование социальных доказательств, логика убеждения, акцент на выгодах, а не только на особенностях.",
+    "Ясность (clarity_score): Простота понимания, минимизация жаргона, четкая структура, последовательность изложения.",
+    "Уникальность (uniqueness_score): Дифференциация от конкурентов, уникальное ценностное предложение, отстройка на уровне текста.",
+    "Призывы к действию (cta_effectiveness_score): Количество, расположение, формулировка, побудительная сила CTA.",
+    "SEO-потенциал (seo_potential): Использование ключевых слов, структура заголовков (H1-H3), читаемость, потенциал для улучшения.",
+    "Стиль и тон: Соответствие голоса бренду, тональность (формальная/неформальная), эмоциональная окраска.",
+    "Структура: Логика повествования, иерархия информации, сбалансированность разделов.",
+    "Целевая аудитория: На кого точно ориентирован текст, какие потребности и боли закрывает.",
+    "Конкурентное позиционирование: Как текст позиционирует продукт/услугу относительно конкурентов."
+  ],
+  
+  "important_notes": [
+    "Будь конкретен и объективен. Приводи примеры из текста для иллюстрации своих выводов.",
+    "quantitative_scores: Все метрики используют единую шкалу 0-10, где 10 = отлично, 0 = плохо.",
+    "Массивы (strengths, weaknesses, unique_offers, competitive_advantages, competitive_threats, actionable_recommendations.*): Должны содержать 3-5 конкретных, измеримых пунктов.",
+    "actionable_recommendations: Приоритизируй рекомендации. Высокий приоритет — критические проблемы, требующие немедленного исправления; средний — улучшения для повышения эффективности; низкий — оптимизации и «полировки».",
+    "Пиши на русском языке.",
+    "Анализ должен быть практичным и полезным для копирайтера, маркетолога и контент-стратега."
+  ],
+  
+  "example_response": {
+    "quantitative_scores": {
+      "persuasiveness_score": 6,
+      "clarity_score": 8,
+      "uniqueness_score": 4,
+      "cta_effectiveness_score": 5,
+      "seo_potential": 7
+    },
+    "qualitative_analysis": {
+      "strengths": ["Четкое описание функционала продукта", "Хорошая структура с выделением ключевых разделов", "Использование реальных цифр в описании результатов"],
+      "weaknesses": ["Слишком много технических терминов без пояснений", "Отсутствие реальных кейсов клиентов", "Слабый эмоциональный вовлекающий компонент"],
+      "unique_offers": ["Гарантия возврата средств в течение 90 дней", "Бесплатный onboarding-период с персональным менеджером"],
+      "competitive_advantages": ["Более подробное техническое описание по сравнению с конкурентами", "Четкая сравнительная таблица тарифов"],
+      "competitive_threats": ["Недостаточно ярко выражено УТП на фоне конкурентов", "Текст не закрывает возражение о сложности внедрения"]
+    },
+    "style_and_tone_analysis": {
+      "voice_and_tone": "Формальный экспертный тон, ориентированный на технических специалистов",
+      "target_audience_alignment": "Соответствует IT-директорам, но может отпугнуть нетехнических руководителей",
+      "emotional_triggers": "Апелляция к эффективности и контролю, но отсутствие триггеров страха упущенной выгоды",
+      "pain_points_coverage": "Хорошо покрывает боль автоматизации процессов, но слабо — боль интеграции с legacy-системами"
+    },
+    "structural_analysis": {
+      "headline_effectiveness": "Информативные, но недостаточно цепляющие заголовки",
+      "information_architecture": "Логичная последовательность: проблема-решение-функционал-тарифы",
+      "argumentation_strength": "Сильная техническая аргументация, слабая бизнес-аргументация",
+      "benefit_presentation": "Преобладание описания функций над выгодами для бизнеса"
+    },
+    "audience_insights": {
+      "primary_audience": "IT-директора и технические руководители средних и крупных компаний",
+      "secondary_audience": "CTO технологических стартапов"
+    },
+    "actionable_recommendations": {
+      "high_priority": ["Добавить раздел с кейсами клиентов и отзывами", "Переписать заголовки с акцентом на выгоды, а не функции", "Упростить технические формулировки для нетехнической аудитории"],
+      "medium_priority": ["Добавить FAQ-секцию для работы с возражениями", "Внедрить больше социальных доказательств (логотипы клиентов)", "Оптимизировать CTA-кнопки под разные стадии воронки"],
+      "low_priority": ["Добавить глоссарий технических терминов", "Внедрить скрипты для микро-конверсий", "Оптимизировать текст под LSI-запросы"]
+    },
+    "summary": "Текст конкурента силен в техническом описании (clarity_score: 8), но слаб в эмоциональном убеждении (persuasiveness_score: 6) и дифференциации (uniqueness_score: 4). Низкая уникальность объясняется отсутствием ярко выраженного УТП. Основная рекомендация — добавить социальные доказательства и переориентировать текст с функций на бизнес-выгоды."
+  }
+}"""
 
         start_time = time.time()
         logger.info("  Отправка запроса к API...")
@@ -106,17 +231,30 @@ class OpenAIService:
             elapsed = time.time() - start_time
             logger.info(f"  ✓ Ответ получен за {elapsed:.2f} сек")
             
+            if not response.choices:
+                raise ValueError("API вернул пустой ответ (нет choices)")
             content = response.choices[0].message.content
+            if not content or not content.strip():
+                raise ValueError("API вернул пустое содержимое ответа")
             logger.info(f"  Длина ответа: {len(content)} символов")
             logger.debug(f"  Использовано токенов: {response.usage.total_tokens if response.usage else 'N/A'}")
             
             data = self._parse_json_response(content)
             
+            # Маппинг из вложенной структуры ответа (qualitative_analysis, actionable_recommendations)
+            qualitative = data.get("qualitative_analysis") or {}
+            actionable = data.get("actionable_recommendations") or {}
+            recs = (
+                actionable.get("high_priority", [])
+                + actionable.get("medium_priority", [])
+                + actionable.get("low_priority", [])
+            )
+            
             result = CompetitorAnalysis(
-                strengths=data.get("strengths", []),
-                weaknesses=data.get("weaknesses", []),
-                unique_offers=data.get("unique_offers", []),
-                recommendations=data.get("recommendations", []),
+                strengths=qualitative.get("strengths", []) or data.get("strengths", []),
+                weaknesses=qualitative.get("weaknesses", []) or data.get("weaknesses", []),
+                unique_offers=qualitative.get("unique_offers", []) or data.get("unique_offers", []),
+                recommendations=recs or data.get("recommendations", []),
                 summary=data.get("summary", "")
             )
             
@@ -139,22 +277,121 @@ class OpenAIService:
         logger.info(f"  MIME тип: {mime_type}")
         logger.info(f"  Модель: {self.vision_model}")
         
-        system_prompt = """Ты — эксперт по визуальному маркетингу и дизайну. Проанализируй изображение конкурента (баннер, сайт, упаковка товара и т.д.) и верни структурированный JSON-ответ.
-
-Формат ответа (строго JSON):
-{
-    "description": "Детальное описание того, что изображено",
-    "marketing_insights": ["инсайт 1", "инсайт 2", ...],
-    "visual_style_score": 7,
-    "visual_style_analysis": "Анализ визуального стиля конкурента",
-    "recommendations": ["рекомендация 1", "рекомендация 2", ...]
-}
-
-Важно:
-- visual_style_score от 0 до 10
-- Каждый массив должен содержать 3-5 пунктов
-- Пиши на русском языке
-- Оценивай: цветовую палитру, типографику, композицию, UX/UI элементы"""
+        system_prompt = """{
+  "system_prompt": "Ты — эксперт по визуальному маркетингу, дизайну и брендингу. Проанализируй изображение конкурента (баннер, сайт, упаковку товара, социальный пост, логотип и т.д.) и верни всесторонний, структурированный JSON-ответ.",
+  
+  "response_format": {
+    "type": "json_object",
+    "structure": {
+      "image_description": "Детальное описание того, что изображено, включая все ключевые элементы",
+      "quantitative_scores": {
+        "visual_style_score": "Общая оценка визуального стиля и эстетики (0-10, где 10 — отличная эстетика и стилистическая целостность)",
+        "composition_score": "Оценка композиции, баланса и визуальной иерархии (0-10, где 10 — идеальная композиция)",
+        "color_palette_score": "Оценка цветовой палитры и гармонии цветов (0-10, где 10 — идеальная гармония и психологическое воздействие)",
+        "typography_score": "Оценка типографики, читаемости и иерархии шрифтов (0-10, где 10 — отличная читаемость и иерархия)",
+        "branding_consistency_score": "Оценка соответствия бренд-буку и узнаваемости (0-10, где 10 — полная консистентность)",
+        "emotional_impact_score": "Оценка эмоционального воздействия (0-10, где 10 — сильное эмоциональное вовлечение)",
+        "conversion_potential": "Конверсионный потенциал визуала (0-10, где 10 — максимально стимулирует к действию)"
+      },
+      "qualitative_analysis": {
+        "marketing_insights": "Маркетинговые инсайты из визуала (3-5 конкретных пунктов)",
+        "design_strengths": "Сильные стороны дизайна (3-5 конкретных пунктов)",
+        "design_weaknesses": "Слабые стороны дизайна (3-5 конкретных пунктов)",
+        "unique_visual_elements": "Уникальные визуальные элементы (3-5 конкретных пунктов)",
+        "competitive_advantages": "Визуальные преимущества перед конкурентами (3-5 конкретных пунктов)",
+        "competitive_threats": "Визуальные уязвимости для атаки конкурентов (3-5 конкретных пунктов)"
+      },
+      "technical_design_analysis": {
+        "layout_composition": "Анализ композиции (правило третей, баланс, фокусные точки)",
+        "color_psychology": "Психологическое воздействие цветовой палитры",
+        "typography_details": "Детальный анализ шрифтов и их сочетания",
+        "imagery_quality": "Качество изображений/иллюстраций",
+        "ux_ui_elements": "Анализ UX/UI элементов (кнопки, навигация и т.д.; не применимо для некоторых типов изображений — укажи 'не применимо' при необходимости)"
+      },
+      "brand_identity_analysis": {
+        "brand_consistency": "Соответствие бренд-идентичности",
+        "target_audience_appeal": "Привлекательность для целевой аудитории",
+        "brand_personality": "Передаваемая личность бренда через визуал",
+        "memorability_factor": "Фактор запоминаемости"
+      },
+      "audience_insights": {
+        "primary_audience": "Основная целевая аудитория, на которую ориентирован визуал",
+        "secondary_audience": "Вторичная аудитория, которую может зацепить визуал"
+      },
+      "actionable_recommendations": {
+        "high_priority": "Рекомендации высокого приоритета (3-5 конкретных пунктов)",
+        "medium_priority": "Рекомендации среднего приоритета (3-5 конкретных пунктов)",
+        "low_priority": "Рекомендации низкого приоритета (3-5 конкретных пунктов)"
+      },
+      "summary": "Комплексное резюме анализа. Выдели самое главное: общее впечатление, ключевую сильную сторону и главную рекомендацию. Кратко обоснуй ключевые количественные оценки (особенно отклонения от 7+ или ниже 5)."
+    }
+  },
+  
+  "analysis_criteria": [
+    "Композиция (composition_score): Баланс элементов, правило третей, визуальная иерархия, направление взгляда, фокусные точки.",
+    "Цветовая палитра (color_palette_score): Гармония цветов, контрастность, психологическое воздействие, соответствие бренду, доступность (цветовой контраст для текста).",
+    "Типографика (typography_score): Читаемость, сочетание шрифтов, иерархия, размеры, межстрочные интервалы, соответствие тону бренда.",
+    "Визуальный стиль (visual_style_score): Общая эстетика, современность, уникальность, качество графики/изображений, стилистическая целостность.",
+    "Брендинг (branding_consistency_score): Узнаваемость бренда, соответствие бренд-буку, консистентность логотипа, цветов и шрифтов.",
+    "Эмоциональное воздействие (emotional_impact_score): Какие эмоции вызывает визуал, насколько он вовлекает, запоминаемость.",
+    "Конверсионный потенциал (conversion_potential): Ясность CTA, убедительность, стимулирование к действию, минимизация отвлекающих факторов.",
+    "UX/UI элементы: Удобство использования, интуитивность, доступность, ясность навигации и взаимодействия (применимо к интерфейсам и баннерам)."
+  ],
+  
+  "important_notes": [
+    "Будь конкретен и объективен. Приводи примеры из изображения для иллюстрации выводов.",
+    "quantitative_scores: Все метрики используют единую шкалу 0-10, где 10 = отлично, 0 = плохо.",
+    "Массивы (qualitative_analysis.*, actionable_recommendations.*): Должны содержать 3-5 конкретных, измеримых пунктов.",
+    "actionable_recommendations: Приоритизируй рекомендации. Высокий приоритет — критические проблемы, влияющие на конверсию или восприятие бренда; средний — улучшения для повышения эстетики и вовлечённости; низкий — оптимизации и «полировка».",
+    "Пиши на русском языке.",
+    "Учитывай тип изображения (баннер, упаковка, лендинг и т.д.) в своём анализе. Для элементов, не применимых к данному типу (например, UX/UI для логотипа), указывай 'не применимо'.",
+    "Анализ должен быть практичным и полезным для дизайнера, маркетолога и бренд-менеджера."
+  ],
+  
+  "example_response": {
+    "image_description": "Рекламный баннер для премиального кофе. На темном фоне расположена чашка кофе с идеальной пенкой, рядом - пачка кофе в золотой упаковке. В левом верхнем углу логотип бренда, в правом нижнем - кнопка 'Заказать пробный набор'. Текст: 'Элитный кофе из Колумбии. Ощутите вкус совершенства.'",
+    "quantitative_scores": {
+      "visual_style_score": 8,
+      "composition_score": 9,
+      "color_palette_score": 7,
+      "typography_score": 8,
+      "branding_consistency_score": 9,
+      "emotional_impact_score": 7,
+      "conversion_potential": 6
+    },
+    "qualitative_analysis": {
+      "marketing_insights": ["Акцент на премиальность через темный фон и золотые акценты", "Использование аппетитного изображения продукта для создания желания", "Четкое позиционирование как элитного продукта"],
+      "design_strengths": ["Идеальная композиция с направлением взгляда от чашки к CTA", "Высокое качество фотографии продукта", "Консистентное использование фирменных цветов бренда"],
+      "design_weaknesses": ["Слишком темная палитра может не привлекать достаточно внимания в ленте", "Текст 'Ощутите вкус совершенства' слишком абстрактный", "Кнопка CTA недостаточно контрастная на темном фоне"],
+      "unique_visual_elements": ["Золотая упаковка с текстурой, напоминающей кофейные зерна", "Специально разработанная чашка с логотипом бренда"],
+      "competitive_advantages": ["Более качественная фотография по сравнению с основными конкурентами", "Узнаваемый и премиальный визуальный стиль"],
+      "competitive_threats": ["Конкуренты используют более яркие и привлекающие внимание цветовые схемы", "Некоторые конкуренты показывают процесс приготовления, что создает больше вовлеченности"]
+    },
+    "technical_design_analysis": {
+      "layout_composition": "Используется правило третей: чашка в левой трети, текст в центральной, CTA в правой нижней точке интереса. Взгляд естественно движется от чашки к кнопке.",
+      "color_psychology": "Темные тона передают роскошь и изысканность, золотой добавляет премиальности. Однако может вызывать ощущение тяжести.",
+      "typography_details": "Используется элегантный serif шрифт для заголовка, передающий традиционность и качество. Sans-serif для кнопки для современности.",
+      "imagery_quality": "Профессиональная фотосъемка с идеальным освещением, подчеркивающим текстуру пенки и блеск упаковки.",
+      "ux_ui_elements": "Кнопка CTA имеет стандартный размер, но недостаточный цветовой контраст (соотношение 3.8:1 вместо рекомендуемых 4.5:1)."
+    },
+    "brand_identity_analysis": {
+      "brand_consistency": "Полное соответствие бренд-буку: цвета, шрифты, логотип размещен правильно.",
+      "target_audience_appeal": "Ориентирован на аудиторию 30-50 лет с высоким доходом, ценящую качество и готовую платить за премиум.",
+      "brand_personality": "Передает личности: изысканный, традиционный, качественный, эксклюзивный.",
+      "memorability_factor": "Высокий за счет уникальной золотой упаковки и качественной фотографии."
+    },
+    "audience_insights": {
+      "primary_audience": "Люди 30-50 лет, с доходом выше среднего, ценители кофе, готовые платить за качество",
+      "secondary_audience": "Корпоративные клиенты, ищущие премиальные продукты для бизнес-подарков"
+    },
+    "actionable_recommendations": {
+      "high_priority": ["Увеличить контрастность кнопки CTA до соотношения 4.5:1 для лучшей заметности и доступности", "Добавить социальное доказательство (например, 'Выбор бариста 2024') для усиления доверия"],
+      "medium_priority": ["Протестировать более светлый вариант фона для повышения заметности в ленте соцсетей", "Заменить абстрактный текст на более конкретный выгодный заголовок (например, 'Свежеобжаренный кофе с нотками шоколада')"],
+      "low_priority": ["Добавить микротекстуру на фон для глубины и тактильности", "Создать анимированную версию с паром от кофе для цифровых каналов"]
+    },
+    "summary": "Визуал конкурента демонстрирует высокое качество исполнения (composition_score: 9, branding_consistency_score: 9) и четкое позиционирование в премиум-сегменте. Основная слабость — недостаточная конверсионность (conversion_potential: 6) из-за слабой заметности CTA и абстрактного текста. Ключевая рекомендация — усилить контраст кнопки и конкретизировать оффер для повышения конверсии."
+  }
+}"""
 
         start_time = time.time()
         logger.info("  Отправка запроса к Vision API...")
@@ -187,18 +424,53 @@ class OpenAIService:
             elapsed = time.time() - start_time
             logger.info(f"  ✓ Ответ получен за {elapsed:.2f} сек")
             
+            if not response.choices:
+                raise ValueError("API вернул пустой ответ (нет choices)")
             content = response.choices[0].message.content
+            if not content or not content.strip():
+                logger.warning("  API вернул пустой ответ (возможен отказ из-за контента)")
+                raise ContentPolicyError()
             logger.info(f"  Длина ответа: {len(content)} символов")
+            
+            # Ответ похож на отказ из-за политики контента — не парсим как JSON
+            if self._is_content_refusal(content):
+                logger.warning("  Обнаружен отказ API по политике контента")
+                raise ContentPolicyError()
             
             data = self._parse_json_response(content)
             
-            result = ImageAnalysis(
-                description=data.get("description", ""),
-                marketing_insights=data.get("marketing_insights", []),
-                visual_style_score=data.get("visual_style_score", 5),
-                visual_style_analysis=data.get("visual_style_analysis", ""),
-                recommendations=data.get("recommendations", [])
+            # Маппинг полей из формата ответа API (image_description, quantitative_scores, qualitative_analysis, summary, actionable_recommendations)
+            quantitative = data.get("quantitative_scores") or {}
+            qualitative = data.get("qualitative_analysis") or {}
+            actionable = data.get("actionable_recommendations") or {}
+            recommendations_list = (
+                actionable.get("high_priority", [])
+                + actionable.get("medium_priority", [])
+                + actionable.get("low_priority", [])
             )
+            
+            raw_score = quantitative.get("visual_style_score", data.get("visual_style_score", 5))
+            visual_score = int(raw_score) if raw_score is not None else 5
+            visual_score = max(0, min(10, visual_score))
+            
+            description = data.get("image_description", "") or data.get("description", "")
+            # Пустое описание при пустом или не-JSON ответе — вероятен отказ по контенту
+            if not description.strip() and (not data or self._is_content_refusal(content)):
+                logger.warning("  Нет описания изображения при отказе/пустом ответе — недопустимый контент")
+                raise ContentPolicyError()
+            
+            result = ImageAnalysis(
+                description=description,
+                marketing_insights=qualitative.get("marketing_insights", []) or data.get("marketing_insights", []),
+                visual_style_score=visual_score,
+                visual_style_analysis=data.get("summary", "") or data.get("visual_style_analysis", ""),
+                recommendations=recommendations_list or data.get("recommendations", [])
+            )
+            
+            # Если в итоге описание пустое, а ответ был коротким/текстовым — считаем отказом
+            if not result.description.strip() and len(content) < 500:
+                logger.warning("  Пустое описание и короткий ответ — недопустимый контент")
+                raise ContentPolicyError()
             
             logger.info(f"  Результат: оценка стиля {result.visual_style_score}/10")
             logger.info(f"  Инсайтов: {len(result.marketing_insights)}, рекомендаций: {len(result.recommendations)}")
@@ -271,30 +543,94 @@ class OpenAIService:
         context = "\n".join(context_parts)
         logger.debug(f"  Контекст:\n{context}")
         
-        system_prompt = """Ты — эксперт по конкурентному анализу и UX/UI дизайну. Проанализируй скриншот сайта конкурента и верни структурированный JSON-ответ.
-
-Формат ответа (строго JSON):
-{
-    "strengths": ["сильная сторона 1", "сильная сторона 2", ...],
-    "weaknesses": ["слабая сторона 1", "слабая сторона 2", ...],
-    "unique_offers": ["уникальное предложение/фича 1", "уникальное предложение/фича 2", ...],
-    "recommendations": ["рекомендация 1", "рекомендация 2", ...],
-    "summary": "Комплексное резюме анализа сайта конкурента"
-}
-
-При анализе обращай внимание на:
-- Дизайн и визуальный стиль (цвета, шрифты, композиция)
-- UX/UI: навигация, расположение элементов, CTA кнопки
-- Контент: заголовки, тексты, призывы к действию
-- Уникальные торговые предложения (УТП)
-- Целевая аудитория (на кого ориентирован сайт)
-- Технологичность и современность дизайна
-
-Важно:
-- Каждый массив должен содержать 4-6 конкретных пунктов
-- Пиши на русском языке
-- Будь конкретен и практичен
-- Давай actionable рекомендации"""
+        system_prompt = """{"system_prompt": "Ты — эксперт по конкурентному анализу, UX/UI дизайну и веб-разработке. Проанализируй скриншот или интерфейс сайта конкурента и верни всесторонний, структурированный JSON-ответ.",
+  
+  "response_format": {
+    "type": "json_object",
+    "structure": {
+      "quantitative_scores": {
+        "design_score": "Общая оценка визуального стиля и эстетики (0-10, где 10 — отличная эстетика и согласованность)",
+        "usability_score": "Оценка удобства и интуитивности интерфейса (0-10, где 10 — максимально удобно и интуитивно)",
+        "content_clarity_score": "Оценка ясности и убедительности контента (0-10, где 10 — идеальная ясность и убедительность)",
+        "trust_score": "Оценка факторов, вызывающих доверие (оформление, отзывы, гарантии) (0-10, где 10 — максимальное доверие)",
+        "animation_potential": "Уровень реализации анимаций и микровзаимодействий (0-10, где 10 — идеально реализовано, 0 — требует серьёзной доработки)"
+      },
+      "qualitative_analysis": {
+        "strengths": "Сильные стороны интерфейса (3-5 конкретных пунктов)",
+        "weaknesses": "Слабые стороны интерфейса (3-5 конкретных пунктов)",
+        "unique_offers": "Уникальные предложения/фичи в интерфейсе (3-5 конкретных пунктов)",
+        "competitive_advantages": "Явные преимущества перед конкурентами (3-5 конкретных пунктов)",
+        "competitive_threats": "Уязвимости для атаки конкурентов (3-5 конкретных пунктов)"
+      },
+      "technical_aspects": {
+        "responsive_design_quality": "Оценка адаптивности интерфейса под разные устройства и размеры экранов",
+        "modern_technologies": "Используемые современные технологии/подходы (массив строк: например, ['PWA', 'SPA', 'Lazy loading'])",
+        "accessibility_notes": "Замечания по доступности интерфейса (контрастность, ARIA-метки, навигация с клавиатуры и т.д.)"
+      },
+      "audience_insights": {
+        "primary_audience": "Основная предполагаемая целевая аудитория (демография, профессия, потребности)",
+        "secondary_audience": "Вторичная аудитория, которую может зацепить интерфейс"
+      },
+      "actionable_recommendations": {
+        "high_priority": "Рекомендации высокого приоритета (3-5 конкретных пунктов)",
+        "medium_priority": "Рекомендации среднего приоритета (3-5 конкретных пунктов)",
+        "low_priority": "Рекомендации низкого приоритета (3-5 конкретных пунктов)"
+      },
+      "summary": "Комплексное резюме анализа. Выдели самое главное: позиционирование, ключевое преимущество и главную рекомендацию. Кратко обоснуй ключевые количественные оценки."
+    }
+  },
+  
+  "analysis_criteria": [
+    "Дизайн & Визуал (design_score): Цветовая палитра, типографика, согласованность стиля, качество изображений/иконок, визуальная иерархия, общее впечатление.",
+    "UX & Usability (usability_score): Логика навигации, ясность путей пользователя, доступность и понятность CTA (призывов к действию), скорость восприятия информации, удобство форм.",
+    "Контент & Ясность (content_clarity_score): Убедительность заголовков и текстов, структура контента, ценностное предложение (УТП), тональность голоса.",
+    "Доверие (trust_score): Наличие социальных доказательств (отзывы, кейсы, логотипы клиентов), прозрачность контактов, гарантий, политик, профессиональность оформления.",
+    "Технологии & Анимации (modern_technologies, animation_potential): Современность стеков (например, SPA, PWA), качество и уместность анимаций, потенциал для добавления направляющих микровзаимодействий, производительность.",
+    "Целевая аудитория: На кого ориентирован дизайн и контент (пол, возраст, профессиональный статус, потребности).",
+    "Конкурентное позиционирование: Что выделяет сайт на фоне типичных игроков рынка? Где его слабые места для атаки?"
+  ],
+  
+  "important_notes": [
+    "Будь конкретен, объективен и практичен. Приводи примеры из интерфейса для иллюстрации выводов.",
+    "quantitative_scores: Все метрики используют единую шкалу 0-10, где 10 = отлично, 0 = плохо.",
+    "Массивы (strengths, weaknesses, unique_offers, competitive_advantages, competitive_threats, actionable_recommendations.*): Должны содержать 3-5 конкретных, измеримых пунктов.",
+    "actionable_recommendations: Приоритизируй рекомендации. Высокий приоритет — критичные проблемы, влияющие на конверсию или доверие; средний — улучшения для повышения удобства и вовлечённости; низкий — оптимизации и «полировка» интерфейса.",
+    "Пиши на русском языке.",
+    "Анализ должен быть практичным и полезным для дизайнера, маркетолога и продукт-менеджера."
+  ],
+  
+  "example_response": {
+    "quantitative_scores": {
+      "design_score": 7,
+      "usability_score": 6,
+      "content_clarity_score": 8,
+      "trust_score": 5,
+      "animation_potential": 4
+    },
+    "qualitative_analysis": {
+      "strengths": ["Четкая визуальная иерархия с акцентом на ключевые блоки", "Удачное цветовое решение, соответствующее бренду", "Логичная структура главного меню с понятной группировкой"],
+      "weaknesses": ["Слабая контрастность текста в секции 'О нас' (соотношение 3.2:1 вместо рекомендуемых 4.5:1)", "Отсутствие визуальной обратной связи при нажатии кнопок", "Слишком много шагов в форме заказа (5 шагов вместо оптимальных 2-3)"],
+      "unique_offers": ["Интерактивный калькулятор стоимости на главной странице", "Возможность предзаказа ещё не вышедших продуктов с уведомлением"],
+      "competitive_advantages": ["Лучшая в нише наглядность сравнения тарифов через визуальные карточки", "Уникальный геймифицированный onboarding с прогресс-баром"],
+      "competitive_threats": ["Отсутствие живого чата на фоне 3 из 4 основных конкурентов", "Более скудная галерея проектов (8 работ против 25+ у лидера ниши)"]
+    },
+    "technical_aspects": {
+      "responsive_design_quality": "Хорошая адаптация под мобильные устройства, но проблемы с таблицами на экранах <480px",
+      "modern_technologies": ["CSS-анимации на базе transform/opacity", "Ленивая загрузка изображений (loading='lazy')", "Использование современных шрифтов (variable fonts)"],
+      "accessibility_notes": "Отсутствуют alt-атрибуты у 40% изображений; цветовая схема проходит проверку на контрастность WCAG AA для основного текста, но не для второстепенного"
+    },
+    "audience_insights": {
+      "primary_audience": "Владельцы малого и среднего бизнеса в возрасте 30-50 лет, технически подкованные",
+      "secondary_audience": "Маркетологи и IT-директора крупных компаний, ищущие дополнительные инструменты"
+    },
+    "actionable_recommendations": {
+      "high_priority": ["Добавить онлайн-чат для оперативной поддержки (конкуренты уже используют)", "Увеличить контрастность текста в секции 'О нас' до соотношения 4.5:1", "Сократить форму заказа с 5 до 3 шагов"],
+      "medium_priority": ["Реализовать микроанимации при наведении и нажатии на интерактивные элементы", "Добавить видеопрезентацию продукта в верхнюю часть главной страницы", "Внедрить breadcrumbs для улучшения навигации на многоуровневых страницах"],
+      "low_priority": ["Добавить поддержку темной темы", "Реализовать кастомный курсор в фирменном стиле для десктопной версии", "Добавить параллакс-эффекты для ключевых секций (герой, преимущества)"]
+    },
+    "summary": "Интерфейс силен в визуальной подаче (design_score: 7) и ясности контента (content_clarity_score: 8), но слаб в доверии (trust_score: 5 — отсутствие соц. доказательств) и анимациях (animation_potential: 4 — минимальная обратная связь). Главная рекомендация — внедрить живой чат и улучшить контрастность для повышения конверсии и соответствия стандартам доступности."
+  }
+}"""
 
         start_time = time.time()
         logger.info("  Отправка скриншота в Vision API...")
@@ -327,16 +663,29 @@ class OpenAIService:
             elapsed = time.time() - start_time
             logger.info(f"  ✓ Ответ получен за {elapsed:.2f} сек")
             
+            if not response.choices:
+                raise ValueError("API вернул пустой ответ (нет choices)")
             content = response.choices[0].message.content
+            if not content or not content.strip():
+                raise ValueError("API вернул пустое содержимое ответа")
             logger.info(f"  Длина ответа: {len(content)} символов")
             
             data = self._parse_json_response(content)
             
+            # Маппинг из вложенной структуры (qualitative_analysis, actionable_recommendations)
+            qualitative = data.get("qualitative_analysis") or {}
+            actionable = data.get("actionable_recommendations") or {}
+            recs = (
+                actionable.get("high_priority", [])
+                + actionable.get("medium_priority", [])
+                + actionable.get("low_priority", [])
+            )
+            
             result = CompetitorAnalysis(
-                strengths=data.get("strengths", []),
-                weaknesses=data.get("weaknesses", []),
-                unique_offers=data.get("unique_offers", []),
-                recommendations=data.get("recommendations", []),
+                strengths=qualitative.get("strengths", []) or data.get("strengths", []),
+                weaknesses=qualitative.get("weaknesses", []) or data.get("weaknesses", []),
+                unique_offers=qualitative.get("unique_offers", []) or data.get("unique_offers", []),
+                recommendations=recs or data.get("recommendations", []),
                 summary=data.get("summary", "")
             )
             
@@ -345,7 +694,7 @@ class OpenAIService:
             logger.info(f"    - Слабых сторон: {len(result.weaknesses)}")
             logger.info(f"    - УТП: {len(result.unique_offers)}")
             logger.info(f"    - Рекомендаций: {len(result.recommendations)}")
-            logger.info(f"  Резюме: {result.summary[:100]}...")
+            logger.info(f"  Резюме: {result.summary[:100] if result.summary else '—'}...")
             logger.info("=" * 50)
             
             return result

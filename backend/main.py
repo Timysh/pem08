@@ -5,6 +5,7 @@
 import base64
 import time
 import logging
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -21,9 +22,13 @@ from backend.models.schemas import (
     ParsedContent,
     HistoryResponse
 )
-from backend.services.openai_service import openai_service
+from backend.services.openai_service import openai_service, ContentPolicyError
 from backend.services.parser_service import parser_service
 from backend.services.history_service import history_service
+
+# Корень проекта (родитель папки backend) для путей к фронтенду
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FRONTEND_DIR = PROJECT_ROOT / "frontend"
 
 # Логгер для API
 logger = logging.getLogger("competitor_monitor.api")
@@ -107,7 +112,10 @@ async def shutdown_event():
 async def root():
     """Главная страница - отдаём фронтенд"""
     logger.debug("Запрос главной страницы")
-    return FileResponse("frontend/index.html")
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=500, detail="Фронтенд не найден (index.html)")
+    return FileResponse(str(index_path))
 
 
 @app.post("/analyze_text", response_model=TextAnalysisResponse)
@@ -208,6 +216,13 @@ async def analyze_image(file: UploadFile = File(...)):
         return ImageAnalysisResponse(
             success=True,
             analysis=analysis
+        )
+    except ContentPolicyError as e:
+        logger.warning(f"  ⚠ Недопустимый контент: {e.message}")
+        logger.info("=" * 50)
+        return ImageAnalysisResponse(
+            success=False,
+            error=e.message
         )
     except Exception as e:
         logger.error(f"  ❌ ОШИБКА: {e}")
@@ -347,8 +362,11 @@ async def health_check():
 
 
 # Статические файлы для фронтенда
-app.mount("/static", StaticFiles(directory="frontend"), name="static")
-logger.info("Статические файлы подключены: /static -> frontend/")
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+    logger.info("Статические файлы подключены: /static -> frontend/")
+else:
+    logger.warning("Папка frontend не найдена, /static недоступен")
 
 
 if __name__ == "__main__":
